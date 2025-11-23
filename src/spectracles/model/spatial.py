@@ -2,8 +2,10 @@
 
 from abc import abstractmethod
 
+import jax
 import jax.numpy as jnp
 from equinox import Module
+from jax import vmap
 from jax.scipy.stats import norm
 from jax_finufft import nufft2  # type: ignore
 from jaxtyping import Array
@@ -102,6 +104,80 @@ class FourierGP(SpatialModel):
         fw = self.kernel.feature_weights(self._freqs)
         jacobian = -0.5 * jnp.log(fw).sum()
         return norm.logpdf(x=self.coefficients.val).sum() + jacobian
+
+
+class MultiFourierGP(SpatialModel):
+    """A collection of independent FourierGPs grouped to better batch through fiNUFFT calls.
+    Requires that all component GPs use the same number of modes, but can use different kernels.
+
+    Very much a work in progress.
+    """
+
+    coefficients: Parameter
+    kernels: list[Kernel]
+    n_modes: tuple[int, int]
+    _freqs: Array
+    _shape_info: tuple[int, int, int]
+    _kernels_idx: Array
+
+    def __init__(
+        self,
+        n_components: int,
+        n_modes: tuple[int, int],
+        kernels: list[Kernel],
+        coefficients: Parameter | None = None,
+    ):
+        # Model specfication
+        self.n_modes = n_modes
+        fx, fy = get_freqs(n_modes)
+        self._freqs = jnp.sqrt(fx**2 + fy**2)
+        self.kernels = kernels
+        # Initialise parameters
+        self.coefficients = init_parameter(coefficients, dims=(n_components, *n_modes))
+        # Initialise the shape info
+        p = int(jnp.prod(jnp.array(n_modes)))
+        self._shape_info = (p, p // 2, p)
+        # Kernel indices for vmap
+        self._kernels_idx = jnp.arange(n_components)
+
+    def __call__(self, data: SpatialData) -> Array:
+        # Process each component separately since kernels can be different types
+        results = []
+        for c, kernel in zip(self.coefficients.val, self.kernels):
+            scaled_coeffs = c * kernel.feature_weights(self._freqs)
+            coeffs_processed = self._conj_symmetry(scaled_coeffs.flatten())
+            results.append(coeffs_processed)
+
+        coeffs_for_nufft = jnp.stack(results)  # (n_components, n_modes[0]*n_modes[1])
+
+        model_eval: Array = nufft2(
+            coeffs_for_nufft,  # (n_components, n_data)
+            data.x,  # (1, n_data) where 1 is implicit
+            data.y,  # (1, n_data) where 1 is implicit
+            **FINUFFT_KWDS,
+        ).real  # (n_components, n_data)
+        return model_eval
+
+    def _conj_symmetry(self, c: Array) -> Array:
+        m, h, p = self._shape_info
+        f = 0.5 * jnp.hstack(
+            [c[: h + 1], jnp.zeros(p - h - 1)],
+        ) + 0.5j * jnp.hstack(
+            [jnp.zeros(p - m + h + 1), c[h + 1 :]],
+        )
+        f = f.reshape(self.n_modes)
+        return f + jnp.conj(jnp.flip(f))
+
+    def prior_logpdf(self) -> Array:
+        def single_component_logpdf(c: Array, kernel: Kernel) -> Array:
+            fw = kernel.feature_weights(self._freqs)
+            jacobian = -0.5 * jnp.log(fw).sum()
+            return norm.logpdf(x=c).sum() + jacobian
+
+        logpdfs = vmap(single_component_logpdf, in_axes=(0, 0))(
+            self.coefficients.val, jnp.array(self.kernels)
+        )  # (n_components,)
+        return logpdfs.sum()
 
 
 class PerSpaxel(SpatialModel):
