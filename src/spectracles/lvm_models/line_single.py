@@ -119,9 +119,11 @@ class LVMModelSingle(SpectralSpatialModel):
 def neg_ln_posterior(model, λ, xy_data, data, u_data, mask):
     vmapped_model = jax.vmap(model, in_axes=(0, None))
     ln_like = ln_likelihood(vmapped_model, λ, xy_data, data, u_data, mask)
+    print(ln_like)
     ln_prior = (
-        vmapped_model.line.A_raw.prior_logpdf()
-        + vmapped_model.line.v.prior_logpdf()
-        + vmapped_model.line.vσ_raw.prior_logpdf()
+        model.line.A_raw.prior_logpdf()
+        + model.line.v.prior_logpdf()
+        + model.line.vσ_raw.prior_logpdf()
     )
+    print(ln_prior)
     return -1 * (ln_like + ln_prior)

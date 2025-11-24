@@ -124,11 +124,17 @@ class ConstrainedParameter(Module):
                     raise BoundsError(
                         "Attempted to auto-initialise ConstrainedParameter with zeros by default, "
                         "but this lies outside provided bounds. Please provide a manual "
-                        "intialisation inside the bounds instead."
+                        "initialisation inside the bounds instead."
                     )
             # Or because the user asked for an initial value outside the bounds
             else:
                 raise e
+
+        # Final check that we haven't become a nan somehow
+        if jnp.any(jnp.isnan(self.unconstrained_val)):
+            raise ValueError(
+                "Parameter initialisation resulted in NaN values. Check bounds and initial value. Otherwise, please report this as a bug."
+            )
 
     @property
     def val(self) -> Array:
@@ -183,8 +189,8 @@ def l_bounded(x: Array, lower: float) -> Array:
 
 
 def l_bounded_inv(f: Array, lower: float) -> Array:
-    if jnp.any(f < lower):
-        raise BoundsError("Initial value lies below lower bound.")
+    if jnp.any(f <= lower):
+        raise BoundsError("Initial value lies below or on lower bound.")
     return softplus_inv(f - lower)
 
 
@@ -193,8 +199,8 @@ def u_bounded(x: Array, upper: float) -> Array:
 
 
 def u_bounded_inv(f: Array, upper: float) -> Array:
-    if jnp.any(f > upper):
-        raise BoundsError("Initial value lies above upper bound.")
+    if jnp.any(f >= upper):
+        raise BoundsError("Initial value lies above or on upper bound.")
     return -softplus_inv(upper - f)
 
 
@@ -204,10 +210,10 @@ def lu_bounded(x: Array, lower: float, upper: float) -> Array:
 
 
 def lu_bounded_inv(f: Array, lower: float, upper: float) -> Array:
-    if jnp.any(f < lower):
-        raise BoundsError("Initial value lies below lower bound.")
-    elif jnp.any(f > upper):
-        raise BoundsError("Initial value lies above upper bound.")
+    if jnp.any(f <= lower):
+        raise BoundsError("Initial value lies below or on lower bound.")
+    elif jnp.any(f >= upper):
+        raise BoundsError("Initial value lies above or on upper bound.")
     return softplus_frac_inv((f - lower) / (upper - lower))
 
 
