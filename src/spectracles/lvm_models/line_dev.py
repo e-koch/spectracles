@@ -46,7 +46,7 @@ class FluxCalFactor(SpatialModel):
         return l_bounded(self.f_cal_raw(s), lower=0.0) / l_bounded(0, lower=0.0)
 
 
-class StellarContinuum(SpectralSpatialModel):
+class StellarContinuum(SpatialModel):
     offs: PerSpaxel
 
     def __init__(self, n_spaxels: int, offs: Parameter):
@@ -56,7 +56,17 @@ class StellarContinuum(SpectralSpatialModel):
         return self.offs(s)
 
 
-class SmoothContinuum(SpectralSpatialModel):
+class LSFScatter(SpatialModel):
+    Δσ_lsf: PerSpaxel
+
+    def __init__(self, n_spaxels: int, delta_sigma_lsf: Parameter):
+        self.Δσ_lsf = PerSpaxel(n_spaxels=n_spaxels, spaxel_values=delta_sigma_lsf)
+
+    def __call__(self, s: SpatialDataLVM) -> Array:
+        return self.Δσ_lsf(s)
+
+
+class SmoothContinuum(SpatialModel):
     # Model components
     A_raw: SpatialModel  # Unconstrained line flux, shared with the emission line
     cont_residual_raw: SpatialModel  # "residual" GP part of the continuum
@@ -73,7 +83,7 @@ class SmoothContinuum(SpectralSpatialModel):
         return l_bounded(self.cont_residual_raw(s), lower=A_LOWER)
 
 
-class SkyBackground(SpectralSpatialModel):
+class SkyBackground(SpatialModel):
     level: PerIFUAndTile  # Sky background level per tile and IFU
 
     def __init__(self, n_tiles, ifu_values):
@@ -96,6 +106,7 @@ class EmissionLine(SpectralSpatialModel):
     # Systematics
     v_syst: Parameter  # Systematic velocity offset in km/s
     v_cal: WaveCalVelocity  # Per-IFU Velocity calibration offset in km/s
+    Δσ_lsf: SpatialModel  # LSF scatter in Angstroms
 
     def __call__(self, λ: Array, spatial_data: SpatialDataLVM) -> Array:
         μ_obs = self.μ_obs(spatial_data)
@@ -116,7 +127,7 @@ class EmissionLine(SpectralSpatialModel):
         return self.μ.val * (1 + self.v_obs(s) / C_KMS)
 
     def σ2_obs(self, s, μ_obs) -> Array:
-        return (self.vσ(s) * μ_obs / C_KMS) ** 2 + self.σ_lsf(s) ** 2
+        return (self.vσ(s) * μ_obs / C_KMS) ** 2 + (self.σ_lsf(s) + self.Δσ_lsf(s)) ** 2
 
     def f_cal(self, s) -> Array:
         return l_bounded(self.f_cal_raw(s), lower=0.0) / l_bounded(0, lower=0.0)
@@ -150,6 +161,7 @@ class LVMModelSingle(SpectralSpatialModel):
         eps_1: Parameter,  # Continuum level as a fraction of line peak
         eps_2: Parameter,  # Continuum residual GP level as a fraction of line peak level
         sky_level: Parameter,
+        Δσ_lsf: Parameter,
     ):
         # Latent GPs for line properties
         A_raw_ = FourierGP(n_modes=n_modes, kernel=A_kernel)
@@ -165,6 +177,7 @@ class LVMModelSingle(SpectralSpatialModel):
 
         # Calibration / nuisance components for line
         v_cal_ = WaveCalVelocity(C_v_cal=C_v_cal, μ=line_centre)
+        Δσ_lsf_ = LSFScatter(n_spaxels=n_spaxels, delta_sigma_lsf=Δσ_lsf)
 
         self.stars = StellarContinuum(n_spaxels=n_spaxels, offs=offsets)
         self.line = EmissionLine(
@@ -176,6 +189,7 @@ class LVMModelSingle(SpectralSpatialModel):
             v_bary=v_bary_,
             v_syst=v_syst,
             v_cal=v_cal_,
+            Δσ_lsf=Δσ_lsf_,
         )
         self.cont = SmoothContinuum(
             A_raw=A_raw_,
