@@ -59,13 +59,18 @@ class StellarContinuum(SpectralSpatialModel):
 class SmoothContinuum(SpectralSpatialModel):
     # Model components
     A_raw: SpatialModel  # Unconstrained line flux, shared with the emission line
-    eps: Parameter  # Continuum level
+    cont_residual_raw: SpatialModel  # "residual" GP part of the continuum
+    eps_1: Parameter  # Continuum level as a fraction of line peak
+    eps_2: Parameter  # Continuum level for residual GP (as a fraction of line peak if sharing kernel with A_raw, effectively scales down the variance)
 
     def __call__(self, s: SpatialDataLVM) -> Array:
-        return self.eps.val * self.A(s)
+        return self.eps_1.val * self.A(s) + self.eps_2.val * self.cont_residual(s)
 
     def A(self, s) -> Array:
         return l_bounded(self.A_raw(s), lower=A_LOWER)
+
+    def cont_residual(self, s) -> Array:
+        return l_bounded(self.cont_residual_raw(s), lower=A_LOWER)
 
 
 class SkyBackground(SpectralSpatialModel):
@@ -142,13 +147,17 @@ class LVMModelSingle(SpectralSpatialModel):
         v_syst: Parameter,
         C_v_cal: Parameter,  # MUST be 2 values i.e. shape is (2,)
         f_cal_unconstrained: Parameter,
-        eps: Parameter,  # Continuum level as a fraction of line peak
+        eps_1: Parameter,  # Continuum level as a fraction of line peak
+        eps_2: Parameter,  # Continuum residual GP level as a fraction of line peak level
         sky_level: Parameter,
     ):
         # Latent GPs for line properties
         A_raw_ = FourierGP(n_modes=n_modes, kernel=A_kernel)
         v_ = FourierGP(n_modes=n_modes, kernel=v_kernel)
         vσ_raw_ = FourierGP(n_modes=n_modes, kernel=σ_kernel)
+
+        # Latent GP for residual continuum component (shares kernel with A_raw)
+        cont_residual_raw_ = FourierGP(n_modes=n_modes, kernel=A_kernel)
 
         # Per-spaxel stuff that is measured, not fit for
         σ_lsf_ = PerSpaxel(n_spaxels=n_spaxels, spaxel_values=σ_lsf)
@@ -168,7 +177,12 @@ class LVMModelSingle(SpectralSpatialModel):
             v_syst=v_syst,
             v_cal=v_cal_,
         )
-        self.cont = SmoothContinuum(A_raw=A_raw_, eps=eps)
+        self.cont = SmoothContinuum(
+            A_raw=A_raw_,
+            cont_residual_raw=cont_residual_raw_,
+            eps_1=eps_1,
+            eps_2=eps_2,
+        )
         self.flux_cal = FluxCalFactor(n_tiles=n_tiles, ifu_values=f_cal_unconstrained)
         self.sky = SkyBackground(n_tiles=n_tiles, ifu_values=sky_level)
 
@@ -176,11 +190,6 @@ class LVMModelSingle(SpectralSpatialModel):
         return self.flux_cal(spatial_data) * (
             self.cont(spatial_data) + self.stars(spatial_data) + self.line(λ, spatial_data)
         ) + self.sky(spatial_data)
-
-    # def __call__(self, λ, spatial_data):
-    #     return self.flux_cal(spatial_data) * (
-    #         self.stars(spatial_data) + self.line(λ, spatial_data)
-    #     ) + self.sky(spatial_data)
 
 
 def neg_ln_posterior(model, λ, xy_data, data, u_data, mask):
