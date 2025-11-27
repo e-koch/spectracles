@@ -17,7 +17,7 @@ from spectracles import (
 from spectracles.lvm_models.constants import C_KMS
 from spectracles.lvm_models.likelihood import ln_likelihood
 from spectracles.model.data import SpatialData
-from spectracles.model.spatial import PerIFUAndTile
+from spectracles.model.spatial import PerIFUAndTile, PerTile
 
 A_LOWER = 0.0
 
@@ -37,10 +37,13 @@ class WaveCalVelocity(SpatialModel):
 
 
 class FluxCalFactor(SpatialModel):
-    f_cal_raw: PerIFUAndTile  # Unconstrained flux calibration factor per tile and ifu
+    # f_cal_raw: PerIFUAndTile  # Unconstrained flux calibration factor per tile and ifu
+    f_cal_raw: PerTile  # Unconstrained flux calibration factor per tile
 
-    def __init__(self, n_tiles, ifu_values):
-        self.f_cal_raw = PerIFUAndTile(n_tiles=n_tiles, n_ifus=3, ifu_values=ifu_values)
+    # def __init__(self, n_tiles, ifu_values):
+    def __init__(self, n_tiles, tile_values):
+        # self.f_cal_raw = PerIFUAndTile(n_tiles=n_tiles, n_ifus=3, ifu_values=ifu_values)
+        self.f_cal_raw = PerTile(n_tiles=n_tiles, tile_values=tile_values)
 
     def __call__(self, s: SpatialData) -> Array:
         return l_bounded(self.f_cal_raw(s), lower=0.0) / l_bounded(0, lower=0.0)
@@ -66,6 +69,26 @@ class LSFScatter(SpatialModel):
         return self.Δσ_lsf(s)
 
 
+class LineFluxScatter(SpatialModel):
+    ΔA: PerSpaxel
+
+    def __init__(self, n_spaxels: int, delta_A: Parameter):
+        self.ΔA = PerSpaxel(n_spaxels=n_spaxels, spaxel_values=delta_A)
+
+    def __call__(self, s: SpatialDataLVM) -> Array:
+        return self.ΔA(s)
+
+
+class VelocityScatter(SpatialModel):
+    Δv: PerSpaxel
+
+    def __init__(self, n_spaxels: int, delta_v: Parameter):
+        self.Δv = PerSpaxel(n_spaxels=n_spaxels, spaxel_values=delta_v)
+
+    def __call__(self, s: SpatialDataLVM) -> Array:
+        return self.Δv(s)
+
+
 class SmoothContinuum(SpatialModel):
     # Model components
     A_raw: SpatialModel  # Unconstrained line flux, shared with the emission line
@@ -84,10 +107,13 @@ class SmoothContinuum(SpatialModel):
 
 
 class SkyBackground(SpatialModel):
-    level: PerIFUAndTile  # Sky background level per tile and IFU
+    # level: PerIFUAndTile  # Sky background level per tile and IFU
+    level: PerTile  # Sky background level per tile
 
-    def __init__(self, n_tiles, ifu_values):
-        self.level = PerIFUAndTile(n_tiles=n_tiles, n_ifus=3, ifu_values=ifu_values)
+    # def __init__(self, n_tiles, ifu_values):
+    def __init__(self, n_tiles, tile_values):
+        # self.level = PerIFUAndTile(n_tiles=n_tiles, n_ifus=3, ifu_values=ifu_values)
+        self.level = PerTile(n_tiles=n_tiles, tile_values=tile_values)
 
     def __call__(self, s: SpatialDataLVM) -> Array:
         return self.level(s)
@@ -100,6 +126,10 @@ class EmissionLine(SpectralSpatialModel):
     A_raw: SpatialModel  # Unconstrained line flux
     v: SpatialModel  # Radial velocity in rest frame in km/s
     vσ_raw: SpatialModel  # Broadening velocity in km/s before constraint
+    vσ_raw_mean: Parameter  # Mean of vσ_raw GP
+    # Scatter in line quantities
+    ΔA: SpatialModel  # Line flux scatter
+    Δv: SpatialModel  # Velocity scatter
     # Measured line quantities
     σ_lsf: SpatialModel  # LSF width (std dev) in Angstroms
     v_bary: SpatialModel  # Barycentric velocity CORRECTION in km/s
@@ -111,17 +141,24 @@ class EmissionLine(SpectralSpatialModel):
     def __call__(self, λ: Array, spatial_data: SpatialDataLVM) -> Array:
         μ_obs = self.μ_obs(spatial_data)
         σ2_obs = self.σ2_obs(spatial_data, μ_obs)
-        peak = self.A(spatial_data) / jnp.sqrt(2 * jnp.pi * σ2_obs)
+        peak = self.A_total(spatial_data) / jnp.sqrt(2 * jnp.pi * σ2_obs)
         return peak * jnp.exp(-0.5 * (λ - μ_obs) ** 2 / σ2_obs)
 
     def A(self, s) -> Array:
         return l_bounded(self.A_raw(s), lower=A_LOWER)
 
+    def A_total(self, s) -> Array:
+        return self.A(s) + self.ΔA(s)
+
     def vσ(self, s) -> Array:
-        return l_bounded(self.vσ_raw(s), lower=0.0)
+        return l_bounded(self.vσ_raw(s) + self.vσ_raw_mean.val, lower=0.0)
+
+    def v_total(self, s) -> Array:
+        return self.v(s) + self.Δv(s)
 
     def v_obs(self, s) -> Array:
-        return self.v(s) + self.v_syst.val + self.v_cal(s) - self.v_bary(s)
+        # return self.v(s) + self.v_syst.val + self.v_cal(s) - self.v_bary(s)  # + self.Δv(s)
+        return self.v_total(s) + self.v_syst.val + self.v_cal(s) - self.v_bary(s)
 
     def μ_obs(self, s) -> Array:
         return self.μ.val * (1 + self.v_obs(s) / C_KMS)
@@ -162,11 +199,18 @@ class LVMModelSingle(SpectralSpatialModel):
         eps_2: Parameter,  # Continuum residual GP level as a fraction of line peak level
         sky_level: Parameter,
         Δσ_lsf: Parameter,
+        ΔA: Parameter,
+        Δv: Parameter,
+        vσ_raw_mean: Parameter,
     ):
         # Latent GPs for line properties
         A_raw_ = FourierGP(n_modes=n_modes, kernel=A_kernel)
         v_ = FourierGP(n_modes=n_modes, kernel=v_kernel)
         vσ_raw_ = FourierGP(n_modes=n_modes, kernel=σ_kernel)
+
+        # Scatter in line properties (not currently used)
+        ΔA_ = LineFluxScatter(n_spaxels=n_spaxels, delta_A=ΔA)
+        Δv_ = VelocityScatter(n_spaxels=n_spaxels, delta_v=Δv)
 
         # Latent GP for residual continuum component (shares kernel with A_raw)
         cont_residual_raw_ = FourierGP(n_modes=n_modes, kernel=A_kernel)
@@ -184,7 +228,10 @@ class LVMModelSingle(SpectralSpatialModel):
             μ=line_centre,
             A_raw=A_raw_,
             v=v_,
+            ΔA=ΔA_,
+            Δv=Δv_,
             vσ_raw=vσ_raw_,
+            vσ_raw_mean=vσ_raw_mean,
             σ_lsf=σ_lsf_,
             v_bary=v_bary_,
             v_syst=v_syst,
@@ -197,8 +244,10 @@ class LVMModelSingle(SpectralSpatialModel):
             eps_1=eps_1,
             eps_2=eps_2,
         )
-        self.flux_cal = FluxCalFactor(n_tiles=n_tiles, ifu_values=f_cal_unconstrained)
-        self.sky = SkyBackground(n_tiles=n_tiles, ifu_values=sky_level)
+        # self.flux_cal = FluxCalFactor(n_tiles=n_tiles, ifu_values=f_cal_unconstrained)
+        # self.sky = SkyBackground(n_tiles=n_tiles, ifu_values=sky_level)
+        self.flux_cal = FluxCalFactor(n_tiles=n_tiles, tile_values=f_cal_unconstrained)
+        self.sky = SkyBackground(n_tiles=n_tiles, tile_values=sky_level)
 
     def __call__(self, λ, spatial_data):
         return self.flux_cal(spatial_data) * (
